@@ -6,6 +6,7 @@ BASE = Path(__file__).resolve().parent
 import random
 import secrets
 from aiohttp import web, WSMsgType
+import rptpfr_points as points
 
 MAX_PLAYERS = 4
 COLORS = ['red', 'blue', 'green', 'yellow']
@@ -40,6 +41,13 @@ def finish_round(r, winner):
     r['winner'] = winner['name']
     r['started'] = False
     r['message'] = f"🏆 {winner['name']} remporte la manche et gagne {gained} points !"
+    try:
+        r['rptpfr_rewards'] = points.award(r['match_id'], r['players'], winner['id'])
+    except Exception as exc:
+        import logging
+        logging.exception('RPTPFR: enregistrement des récompenses échoué')
+        r['rptpfr_rewards'] = []
+        r['message'] += ' ⚠ Récompenses RPTPFR indisponibles : contacter un administrateur.'
 
 def player_view(p):
     return {'id': p['id'], 'name': p['name'], 'count': len(p['hand']), 'bot': p.get('bot', False), 'score': p.get('score', 0), 'wins': p.get('wins', 0)}
@@ -51,7 +59,7 @@ def view(room, pid):
             'hand': p['hand'] if p else [], 'you': pid, 'turn': room['players'][room['turn']]['id'] if room['started'] and room['players'] else None,
             'top': room['top'], 'color': room['color'], 'direction': room['direction'],
             'winner': room['winner'], 'winner_id': room.get('winner_id'), 'round': room.get('round', 0), 'last_gain': room.get('last_gain', 0), 'last_breakdown': room.get('last_breakdown', []), 'message': room['message'], 'drawn': room['drawn'],
-            'uno': room['uno'], 'effect_event': room.get('effect_event'), 'traps': [{'owner': t['owner'], 'target': t['target']} for t in room.get('traps', [])]}
+            'uno': room['uno'], 'rptpfr_rewards': room.get('rptpfr_rewards', []), 'effect_event': room.get('effect_event'), 'traps': [{'owner': t['owner'], 'target': t['target']} for t in room.get('traps', [])]}
 
 async def send(ws, data):
     if ws and not ws.closed:
@@ -88,6 +96,8 @@ def draw(r, p, n):
         p['hand'].append(r['deck'].pop())
 
 def start(r):
+    r['match_id'] = secrets.token_hex(16)
+    r['rptpfr_rewards'] = []
     r['deck'] = deck()
     r['discard'] = []
     for p in r['players']:
@@ -251,9 +261,12 @@ async def remove(pid):
     await lobby()
 
 async def websocket(request):
+    if not request['account']:
+        return web.json_response({'error':'Connexion requise'},status=401)
     ws = web.WebSocketResponse(heartbeat=25, max_msg_size=4096)
     await ws.prepare(request)
     pid = secrets.token_hex(8)
+    account = request.get('account')
     clients[pid] = ws
     current = None
     await send(ws, {'type': 'welcome', 'id': pid})
@@ -268,9 +281,11 @@ async def websocket(request):
                 if action in ('create','join'):
                     if current:
                         raise ValueError('Quitte d’abord ton salon.')
-                    name = str(data.get('name','')).strip()[:20]
-                    if not name:
-                        raise ValueError('Choisis un pseudo.')
+                    if not account:
+                        raise ValueError('Connecte-toi à ton compte RPTPFR avant de jouer.')
+                    name = account['pseudo']
+                    if any(any(x.get('account_id') == account['id'] for x in room['players']) for room in rooms.values()):
+                        raise ValueError('Ton compte est déjà présent dans un salon.')
                     if action == 'create':
                         code = secrets.token_hex(3).upper()
                         while code in rooms:
@@ -284,7 +299,7 @@ async def websocket(request):
                         r = rooms.get(code)
                         if not r or r['started'] or len(r['players']) >= MAX_PLAYERS:
                             raise ValueError('Salon introuvable, complet ou déjà en partie.')
-                    r['players'].append({'id': pid, 'name': name, 'hand': [], 'score': 0, 'wins': 0})
+                    r['players'].append({'id': pid, 'name': name, 'account_id': account['id'], 'hand': [], 'score': 0, 'wins': 0})
                     current = code
                     await broadcast(r)
                     continue
@@ -380,10 +395,50 @@ async def websocket(request):
         await remove(pid)
     return ws
 
+@web.middleware
+async def account_middleware(request, handler):
+    request['account'] = None
+    token = request.cookies.get(points.COOKIE)
+    if token:
+        try: request['account'] = await asyncio.to_thread(points.session, token)
+        except Exception: pass
+    return await handler(request)
+
+async def account_auth(request):
+    try:
+        data = await request.json()
+        account = await asyncio.to_thread(points.auth, data.get('pseudo'), data.get('code'), bool(data.get('register')))
+        token, seconds = await asyncio.to_thread(points.new_session, account['id'], bool(data.get('remember',True)))
+        response = web.json_response({'ok':True,'player':account})
+        response.set_cookie(points.COOKIE, token, max_age=seconds, httponly=True, secure=bool(os.getenv('RENDER')), samesite='Lax', path='/')
+        return response
+    except ValueError as exc: return web.json_response({'error':str(exc)},status=400)
+    except Exception:
+        import logging
+        logging.exception('Connexion RPTPFR impossible')
+        return web.json_response({'error':'Base de données temporairement indisponible'},status=503)
+
+async def account_me(request):
+    return web.json_response({'player':request['account']})
+
+async def account_logout(request):
+    await asyncio.to_thread(points.logout,request.cookies.get(points.COOKIE))
+    response=web.json_response({'ok':True})
+    response.del_cookie(points.COOKIE,path='/')
+    return response
+
+async def get_leaderboard(request):
+    try: return web.json_response({'leaderboard':await asyncio.to_thread(points.leaderboard)})
+    except Exception: return web.json_response({'error':'Classement indisponible'},status=503)
+
 async def index(request):
     return web.FileResponse(BASE / 'static' / 'index.html')
 
-app = web.Application()
+app = web.Application(middlewares=[account_middleware])
+app.router.add_post('/api/player/auth',account_auth)
+app.router.add_get('/api/player/me',account_me)
+app.router.add_post('/api/player/logout',account_logout)
+app.router.add_get('/api/games/leaderboard',get_leaderboard)
 app.router.add_get('/', index)
 app.router.add_get('/ws', websocket)
 STATIC_DIR = BASE / 'static'
@@ -395,4 +450,5 @@ if not (STATIC_DIR / 'index.html').is_file():
     )
 app.router.add_static('/static/', STATIC_DIR)
 if __name__ == '__main__':
+    points.setup()
     web.run_app(app, host='0.0.0.0', port=int(os.environ.get('PORT', '8000')))
