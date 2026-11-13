@@ -386,6 +386,13 @@ async def index(request):
 app = web.Application()
 app.router.add_get('/', index)
 app.router.add_get('/ws', websocket)
-app.router.add_static('/static/', BASE / 'static')
+STATIC_DIR = BASE / 'static'
+if not (STATIC_DIR / 'index.html').is_file():
+    raise RuntimeError(
+        f"Fichiers du jeu manquants : {STATIC_DIR / 'index.html'}. "
+        "Sur GitHub, le dossier static doit être à côté de server.py "
+        "et contenir index.html, le logo et les musiques."
+    )
+app.router.add_static('/static/', STATIC_DIR)
 if __name__ == '__main__':
     web.run_app(app, host='0.0.0.0', port=int(os.environ.get('PORT', '8000')))
