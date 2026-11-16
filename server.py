@@ -175,7 +175,7 @@ async def bot_loop(r):
     r['bot_running'] = True
     try:
         while r['started'] and r['players'] and r['players'][r['turn']].get('bot'):
-            await asyncio.sleep(0.85)
+            await asyncio.sleep(3.2)  # Laisser le temps de voir et lire la carte précédente
             if not r['started'] or not r['players'] or not r['players'][r['turn']].get('bot'):
                 break
             p = r['players'][r['turn']]
